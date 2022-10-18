@@ -1,0 +1,384 @@
+---
+title: "Review of Wash Trading Methodologies"
+author: "charliemarketplace.eth"
+date: '2022-10-17'
+output:
+  html_document:
+    toc: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Intro
+
+This markdown seeks to compare and contrast open source methodologies
+for identification and exclusion of "wash" trade transactions of NFTs.
+
+It makes no judgement of the methodologies nor implies their accuracy in
+isolation or against each other. Wash-trading is difficult to identify
+and NFT trading is a highly adversarial environment.
+
+It will focus specifically on the count and type of transactions
+exclusions across different filters; and the marginal effect of
+excluding transactions on various common NFT trading statistics.
+
+There is no target dataset available that perfectly labels wash-trades,
+thus metrics such as accuracy, precision, sensitivity, and specificity
+will not be discussed here.
+
+# Data
+
+The following NFT trade histories are collected from the Flipside Crypto
+EZ_NFT_Sales tables for the Ethereum blockchain. Specification on why
+the collection was included are also provided.
+
+These 2 collections will be loosely referenced as "benchmark"
+collections because they have trades on all 3 platforms.
+
+-   Bored Ape Yacht Club: Top traded collection with volume on OpenSea,
+    LooksRare, and X2Y2, the 3 exchanges of interest for this analysis.
+-   Azuki: A Top traded collection on all three of OpenSea, LooksRare,
+    and X2Y2.
+
+These 3 collections will be loosely referred to as "test" collections
+because they are more concentrated in some exchanges versus others;
+and/or have had large historical shifts on which exchange they trade on.
+
+-   Meebits: High volume collection with a large shift in primary
+    platform traded; originally high volume disproportionally on
+    LooksRare, but shifting to X2Y2 and OpenSea.
+-   More Loot: A high volume collection on LooksRare and X2Y2, with
+    significantly lower volume on OpenSea.
+-   RENGA: A high volume collection on OpenSea and X2Y2, significantly
+    lower on LooksRare.
+
+All NFT collections can have wash-trading. The goal of this analysis is
+to quantify the impacts of transaction exclusion based on different open
+source methodologies including impact on particular exchanges and
+collections which have different websites, users, communities, and fees.
+
+Data is capped at a block height of: 15760000 for reproducibility.
+
+```{r, warning = FALSE, message = FALSE}
+library(shroomDK)
+library(reactable)
+library(plotly)
+library(dplyr)
+
+query <- {
+"SELECT BLOCK_NUMBER, BLOCK_TIMESTAMP, TX_HASH, PLATFORM_NAME, SELLER_ADDRESS, 
+BUYER_ADDRESS, NFT_ADDRESS, PROJECT_NAME, TOKENID, CURRENCY_SYMBOL, 
+PRICE, PRICE_USD, PLATFORM_FEE, CREATOR_FEE 
+FROM ethereum.core.ez_nft_sales 
+WHERE NFT_ADDRESS IN (
+'0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d', --bayc 
+  '0xed5af388653567af2f388e6224dc7c4b3241c544', -- azuki
+  '0x7bd29408f11d2bfc23c34f18275bbf23bb716bc7', -- meebits
+  '0x1dfe7ca09e99d10835bf73044a23b73fc20623df', -- More Loot
+  '0x394e3d3044fc89fcdd966d3cb35ac0b32b0cda91' -- RENGA
+) AND BLOCK_NUMBER <= 15760000
+ORDER BY BLOCK_NUMBER ASC
+"
+}
+
+sales <- shroomDK::auto_paginate_query(query, api_key = readLines("api_key.txt"))
+sales$PROJECT_NAME[is.na(sales$PROJECT_NAME)] <- 'renga' # not labeled in data 
+```
+
+# Methodology
+
+Two methods from [hildobby's DUNE
+Spellbook](https://github.com/duneanalytics/spellbook/pull/1623) are
+considered:
+
+-   **D**une **S**ame **T**raders in last **7** days (dst7): Exclude
+    transactions where the buyer & seller exchanged the same NFT within
+    7 days of the transaction.
+-   **D**une **S**ame **B**uyer **3** times (dsb3): Exclude transactions
+    where the buyer has previously purchased the same NFT 3 or more
+    times ever.
+
+Three methods from a private DUNE dashboard, not linked here (yet).
+
+-   **S**ame **D**ay **s**ame **P**latform **3** times (sdsp3): Exclude
+    transactions where the same NFT was traded 3+ times on the same
+    platform on the same day.
+
+-   **S**ame **D**ay, **S**ame **T**raders **S**ame **P**latform **3**
+    times (sdstsp4): Exclude transactions where the buyer & seller
+    exchanged any NFTs in the same collection 3+ times on the same platform on the same
+    day.
+
+-   **P**rice **10x** in last **7** Days (p10x7): Exclude transactions
+    where the sale price is \>50x the maximum sale price of the NFT in
+    the last 7 days.
+
+To review these methods the following columns are added to the data:
+
+-   day\_: day of sale as a date
+-   traders: an *alphabetized* concatenation of BUYER_ADDRESS and
+    SELLER_ADDRESS; such that the value is the same for the same buyer
+    and seller pair no matter who direction the trade went (i.e., Bob
+    sells to Alice and Alice sells to Bob are both always Alice-Bob) to
+    create a unique id for a pair of traders.
+-   token_traders: The concatenation of NFT Address, Token ID, and traders.
+
+```{r}
+
+sales <- sales %>%
+  mutate(day_ = as.Date(BLOCK_TIMESTAMP))
+
+# speed optimization
+traders <- character(nrow(sales)) 
+token_traders <- character(nrow(sales))
+
+for(i in 1:nrow(sales)){
+  traders[i] <- paste0( 
+    sort( 
+      c(sales$BUYER_ADDRESS[i], sales$SELLER_ADDRESS[i]) 
+    ),
+    collapse = "-")
+  
+  token_traders[i] <-
+    paste0(
+      c(sales$NFT_ADDRESS[i], 
+        sales$TOKENID[i],
+        traders[i]),
+    collapse = "-")
+  
+}
+
+sales$traders <- traders
+sales$token_traders <- token_traders
+
+rm(traders)
+rm(token_traders)
+
+```
+
+Implementing each method as a TRUE/FALSE column for whether the transaction meets the condition.
+
+dst7: Dune Same Traders in Last 7 Days.
+
+Group buy NFT, TOKENID, and Trader Pair; Arrange by day of sale, and if the last time
+these traders traded the same NFT was within 7 days, mark that transaction as dst7 = TRUE.
+
+```{r}
+
+sales <- sales %>% group_by(token_traders) %>%
+  arrange(token_traders, day_) %>% 
+  mutate(dst7 = ifelse( day_ - lag(day_) <= 7, TRUE, FALSE) )
+
+sales$dst7[is.na(sales$dst7)] <- FALSE
+
+```
+
+dsb3: Dune Same Buyer 3+ Times
+
+Group by NFT, TOKENID, and BUYER; Arrange by day of sale; if this same buyer has bought this 
+same NFT 3+ times *ever*, mark the 3rd through Nth purchases as dsb3 = TRUE. 
+
+```{r}
+sales <- sales %>% 
+  group_by(NFT_ADDRESS, TOKENID, BUYER_ADDRESS, .add = TRUE) %>% 
+  arrange(NFT_ADDRESS, TOKENID, BUYER_ADDRESS, day_) %>% 
+  mutate(dsb3 = ifelse(row_number() >= 3, TRUE, FALSE)) 
+
+```
+
+sdsp3: Same Day Same Platform 3+ Times 
+
+Group by NFT, TOKENID, Platform and Day of Sale; if the same NFT traded on the same day on 
+the same platform 3+ times; mark *all* of those sales as sdsp3 = TRUE.
+
+```{r}
+sales <- sales %>% 
+    group_by(NFT_ADDRESS, TOKENID, PLATFORM_NAME, day_, .add = TRUE) %>% 
+  mutate(sdsp3 = ifelse(n() >= 3, TRUE, FALSE)) 
+
+```
+
+sdstsp3: Same Day, Same Trader, Same Platform 3+ Times
+
+GROUP BY NFT, Platform, Traders, and Day: If the same Traders traded the same collection on the same platform 3+ times on the same day, mark all their trades of that NFT collection as sdstsp3 = TRUE.
+
+```{r}
+sales <- sales %>% 
+    group_by(NFT_ADDRESS, traders, PLATFORM_NAME, day_, .add = TRUE) %>% 
+  mutate(sdstsp3 = ifelse(n() >= 3, TRUE, FALSE)) 
+
+```
+
+p10x7: Price 10x+ of highest sale price in collection of last 7 days.
+
+GROUP BY NFT, Order by Day, track max PRICE_USD (although most trades are in ETH or WETH, some are not, filter to ETH/WETH trades to use PRICE in ETH terms) in last 7 days, and if the price is 10x or larger than max price in last 7 days, mark p10x7 = TRUE.
+
+```{r}
+sales <- sales %>% 
+  mutate(day_num = as.numeric(day_))
+
+p10x7 <- unique(
+  as.data.frame(sales[, c("NFT_ADDRESS", "day_num")])
+)
+
+get_max <- function(address_day_row, trades_data){
+
+  nft = address_day_row[[1]]
+  the_day = as.numeric(address_day_row[[2]])
+  
+  r = NA 
+  
+  temp_tbl <- trades_data %>% filter(
+    NFT_ADDRESS == nft, 
+    day_num > the_day - 7, 
+    day_num < the_day
+  )
+  if(nrow(temp_tbl) != 0){
+  r = max(temp_tbl["PRICE_USD"])
+  }
+  
+    return(r)
+}
+  
+p10x7$max_price <- apply(X = p10x7, MARGIN = 1,
+                         FUN = get_max, 
+                         trades_data = as.data.frame(sales))
+
+sales <- merge(sales, p10x7, all.x = TRUE, all.y = TRUE,
+                        by.x = c("NFT_ADDRESS","day_num"), by.y = c("NFT_ADDRESS","day_num"))
+
+sales <- sales %>% 
+  mutate(p10x7 = ifelse(PRICE_USD >= 10*max_price, TRUE, FALSE))
+
+sales$max_price <- NULL
+sales$p10x7[is.na(sales$p10x7)] <- FALSE 
+
+sales$num_flags <- apply(sales[, c("dst7", "dsb3", "sdsp3","sdstsp3","p10x7")], 
+                        MARGIN = 1, 
+                        FUN = sum)
+
+```
+
+# Results by Collection
+
+The benchmark collections: Azuki and Bored Ape Yacht Club exist across
+
+```{r}
+
+as_percent <- function(x){
+  paste0(round(x),"%")
+}
+
+sales_tbl <- sales %>% group_by(PROJECT_NAME) %>% 
+  summarise(num_sales = n(),
+            num_dst7 = sum(dst7),
+            percent_dst7 = as_percent(sum(dst7)*100/n()),
+            num_dsb3 = sum(dsb3),
+            percent_dsb3 = as_percent(sum(dsb3)*100/n()),
+            num_sdsp3 = sum(sdsp3),
+            percent_sdsp3 = as_percent(sum(sdsp3)*100/n()),
+            num_sdstsp3 = sum(sdstsp3),
+            percent_sdstsp3 = as_percent(sum(sdstsp3)*100/n()),
+            num_p10x7 = sum(p10x7),
+            percent_p10x7 = as_percent(sum(p10x7)*100/n()),
+            num_1plus_flag = sum(num_flags > 0),
+            percent_1plus_flag = as_percent(sum(num_flags > 0)*100/n())
+  ) %>% as.data.frame()
+
+colnames(sales_tbl) <- c("Project", "# Sales",
+                         "# DST7", "DST7 %",
+                         "# DSB3", "DSB3 %",
+                         "# SDSP3", "SDSP3 %",
+                         "# SDSTSP3", "SDSTSP3 %",
+                         "# p10x7", "p10x7 %",
+                         "# 1+ Metric", "1+ Metric %")
+
+reactable(sales_tbl)
+
+```
+
+# Results by Platform 
+
+```{r}
+
+platform_tbl <- sales %>% group_by(PLATFORM_NAME) %>% 
+  summarise(num_sales = n(),
+            num_dst7 = sum(dst7),
+            percent_dst7 = as_percent(sum(dst7)*100/n()),
+            num_dsb3 = sum(dsb3),
+            percent_dsb3 = as_percent(sum(dsb3)*100/n()),
+            num_sdsp3 = sum(sdsp3),
+            percent_sdsp3 = as_percent(sum(sdsp3)*100/n()),
+            num_sdstsp3 = sum(sdstsp3),
+            percent_sdstsp3 = as_percent(sum(sdstsp3)*100/n()),
+            num_p10x7 = sum(p10x7),
+            percent_p10x7 = as_percent(sum(p10x7)*100/n()),
+            num_1plus_flag = sum(num_flags > 0),
+            percent_1plus_flag = as_percent(sum(num_flags > 0)*100/n())
+  ) %>% as.data.frame()
+
+colnames(platform_tbl) <- c("Platform", "# Sales",
+                         "# DST7", "DST7 %",
+                         "# DSB3", "DSB3 %",
+                         "# SDSP3", "SDSP3 %",
+                         "# SDSTSP3", "SDSTSP3 %",
+                         "# p10x7", "p10x7 %",
+                         "# 1+ Metric", "1+ Metric %")
+
+reactable(platform_tbl)
+```
+
+# Comparison of Metric Results 
+
+## DST7 - the most aggressive method
+
+Surprisingly, on the margins the most aggressive metric was DST7: The same 
+buyer and seller trading the same NFT TOKEN ID within the last 7 days.
+
+This is *not* to say this metric was accurate in judging a transaction as a true 
+positive sale. 
+
+It is simply noting that this metric consistently labeled the largest amount 
+of transactions while also capturing a significant portion of all other metrics 
+labels as well.
+
+## SDSP3 and SDSTP3 were exactly 100% correlated
+
+Note: Among the 5 NFT collections, there is a 100% correlation between metrics 
+SDSP3 and SDSTSP3. That is; in *every* instance that the same NFT ID was traded
+on the same day on the same platform 3+ times (SDSP3); it was *always* done 
+by the **same traders** at the collection level. The corollary is also true, that 
+the same traders trading the same NFT *collections* on the same day on the same platform, *always* traded the same TOKENIDs 3+ times as well. 
+
+There was not a single instance of traders balancing the counts of trading 
+token IDs while trading within a collection, nor traders triangulating TOKENID 
+trades between a 3rd/4th/5th address.
+
+## P10X7 is an extremely passive label.
+
+Trades occuring at 10x+ the highest USD price in the last 7 days (not including 
+the same day) were extremely rare (< 1% of trades). In situations where this happens, it is possible that specific traits of the NFT (i.e., rarity) are the cause. 
+
+# Conclusion 
+
+With p10x7 being so rarely applied; and sdsp3 & sdstsp3 being 100% correlated. 
+Comparing dst7, dsb3, and sdsp3 as the metrics of most marginal information 
+shows the following correlation matrix.
+
+**Without information on false positives and false negatives** these metrics
+cannot be optimized toward a target rate.
+
+```{r}
+
+plot_ly(z = cor(sales[,19:21]), 
+        x = ~colnames(sales[,19:21]), 
+        y = ~colnames(sales[,19:21]), 
+        type = 'heatmap') %>% 
+  layout(xaxis = list(title = ""),
+         yaxis = list(title = "")
+         )
+
+```
