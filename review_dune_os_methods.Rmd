@@ -103,7 +103,7 @@ considered:
 
 Three methods from a private DUNE dashboard, not linked here (yet).
 
--   **S**ame **D**ay **s**ame **P**latform **3** times (sdsp3): Exclude
+-   **S**ame **D**ay **S**ame **P**latform **3** times (sdsp3): Exclude
     transactions where the same NFT was traded 3+ times on the same
     platform on the same day.
 
@@ -113,8 +113,8 @@ Three methods from a private DUNE dashboard, not linked here (yet).
     day.
 
 -   **P**rice **10x** in last **7** Days (p10x7): Exclude transactions
-    where the sale price is \>50x the maximum sale price of the NFT in
-    the last 7 days.
+    where the sale price is \>10x the maximum sale price of the NFT in
+    the previous 7 days.
 
 To review these methods the following columns are added to the data:
 
@@ -159,9 +159,11 @@ rm(token_traders)
 
 ```
 
+# Implementation 
+
 Implementing each method as a TRUE/FALSE column for whether the transaction meets the condition.
 
-dst7: Dune Same Traders in Last 7 Days.
+### dst7: Dune Same Traders in Last 7 Days.
 
 Group buy NFT, TOKENID, and Trader Pair; Arrange by day of sale, and if the last time
 these traders traded the same NFT was within 7 days, mark that transaction as dst7 = TRUE.
@@ -176,10 +178,11 @@ sales$dst7[is.na(sales$dst7)] <- FALSE
 
 ```
 
-dsb3: Dune Same Buyer 3+ Times
+### dsb3: Dune Same Buyer 3+ Times
 
 Group by NFT, TOKENID, and BUYER; Arrange by day of sale; if this same buyer has bought this 
-same NFT 3+ times *ever*, mark the 3rd through Nth purchases as dsb3 = TRUE. 
+same NFT 3+ times *ever*, mark the 3rd through Nth purchases as dsb3 = TRUE (i.e., count the 
+first 2 transactions only).
 
 ```{r}
 sales <- sales %>% 
@@ -189,7 +192,7 @@ sales <- sales %>%
 
 ```
 
-sdsp3: Same Day Same Platform 3+ Times 
+### sdsp3: Same Day Same Platform 3+ Times 
 
 Group by NFT, TOKENID, Platform and Day of Sale; if the same NFT traded on the same day on 
 the same platform 3+ times; mark *all* of those sales as sdsp3 = TRUE.
@@ -201,7 +204,7 @@ sales <- sales %>%
 
 ```
 
-sdstsp3: Same Day, Same Trader, Same Platform 3+ Times
+### sdstsp3: Same Day, Same Trader, Same Platform 3+ Times
 
 GROUP BY NFT, Platform, Traders, and Day: If the same Traders traded the same collection on the same platform 3+ times on the same day, mark all their trades of that NFT collection as sdstsp3 = TRUE.
 
@@ -212,7 +215,7 @@ sales <- sales %>%
 
 ```
 
-p10x7: Price 10x+ of highest sale price in collection of last 7 days.
+### p10x7: Price 10x+ of highest sale price in collection of last 7 days.
 
 GROUP BY NFT, Order by Day, track max PRICE_USD (although most trades are in ETH or WETH, some are not, filter to ETH/WETH trades to use PRICE in ETH terms) in last 7 days, and if the price is 10x or larger than max price in last 7 days, mark p10x7 = TRUE.
 
@@ -263,8 +266,6 @@ sales$num_flags <- apply(sales[, c("dst7", "dsb3", "sdsp3","sdstsp3","p10x7")],
 ```
 
 # Results by Collection
-
-The benchmark collections: Azuki and Bored Ape Yacht Club exist across
 
 ```{r}
 
